@@ -11,6 +11,11 @@
 
 #include "cmsis/cmsis_device.h"
 
+#include "includes/GPIO.h"
+#include "includes/timer.h"
+#include "includes/DAC_ADC.h"
+#include "includes/EXTI.h"
+
 // ----------------------------------------------------------------------------
 //
 // STM32F0 led blink sample (trace via $(trace)).
@@ -54,28 +59,19 @@
 #pragma GCC diagnostic ignored "-Wmissing-declarations"
 #pragma GCC diagnostic ignored "-Wreturn-type"
 
-
-/*** This is partial code for accessing LED Display via SPI interface. ***/
-
-//...
-
-unsigned int Freq = 0;  // Example: measured frequency value (global variable)
-unsigned int Res = 0;   // Example: measured resistance value (global variable)
+unsigned int Freq = 0;
+unsigned int Res = 0;
+volatile uint8_t sw = 0;
+volatile uint8_t timerTriggered = 0;
 
 
 void oled_Write(unsigned char);
 void oled_Write_Cmd(unsigned char);
 void oled_Write_Data(unsigned char);
-void myGPIOB_Init();
-
-void oled_config(void);
-
 void refresh_OLED(void);
-void myTim3Init_Config();
-void myTim3Init_Refresh();
-void ADC_config();
+void oled_Init();
+
 void ADC_update();
-void DAC_config();
 void DAC_update();
 
 SPI_HandleTypeDef SPI_Handle;
@@ -245,8 +241,6 @@ unsigned char Characters[][8] = {
     {0b00001000, 0b00011100, 0b00101010, 0b00001000, 0b00001000,0b00000000, 0b00000000, 0b00000000}   // <-
 };
 
-
-
 void SystemClock48MHz( void )
 {
 //
@@ -285,107 +279,111 @@ void SystemClock48MHz( void )
 }
 
 
-
 int main(int argc, char* argv[])
 {
 
 	SystemClock48MHz();
-	myGPIOB_Init();
-	myTim3Init_Config();//overflow at 3ms
-	RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;
+	RCC->APB1ENR |= RCC_APB1ENR_SPI2EN; //enable clock for SPI
+	RCC->APB2ENR |= RCC_APB2ENR_SYSCFGCOMPEN; //enable clock for SYSCFG registers
 
-	ADC_config();
-	oled_config();
-    myTim3Init_Refresh(); //overflow at 100ms
-    DAC_config();
+	myGPIOC_Init(); //initialize GPIOA
+	myGPIOB_Init(); //initialize GPIOB
+	myGPIOA_Init(); //initialize GPIOC
+
+	myTIM3_Init(); //overflow at 3ms (for oled_init)
+	oled_Init();
+	myTim3Init_Refresh(); //overflow at 100ms (for OLED refresh rate)
+
+	ADC_Init();
+	DAC_Init();
+
+    myTIM2_Init();
+    myEXTI2_3_Init();
+    myEXTI0_1_Init();
 
 	while (1)
 	{
 		ADC_update();
-		DAC_update(); //update DAC_DHR12R1
+		DAC_update();
 		refresh_OLED();
-
 	}
-
 }
 
-void DAC_config(){
-	GPIOA->MODER |= 0x300; //Set PA4 to Analog
-	RCC->APB1ENR |= 0x20000000;
-	DAC1->CR |= DAC_CR_EN1;
-	DAC1->CR &= ~(DAC_CR_BOFF1);
-	DAC1->CR &= ~(DAC_CR_TEN1);
+//---------------------ADC_DAC---------------------//
+
+void DAC_update()
+{
+	DAC1->DHR12R1 = ADC1->DR; //DAC input from ADC output
 }
 
-void DAC_update(){
-	DAC1->DHR12R1 = ADC1->DR;
-}
-
-void ADC_update(){
+void ADC_update()
+{
 	unsigned int adc_value;
 
-	while(((ADC1->ISR) & 0x4) == 0);
-		adc_value = ADC1->DR;
-		Res = (((float)adc_value/4095)*5000);
+	while(((ADC1->ISR) & 0x4) == 0); //wait end of conversion flag
+		adc_value = ADC1->DR; //read data register
+		Res = (((float)adc_value/4095)*5000); //conversion
 }
 
-void ADC_config(){
+//---------------------OLED---------------------//
 
-		RCC-> AHBENR |= RCC_AHBENR_GPIOAEN; //GPIO A CLOCK
-
-		GPIOA->MODER |= 0xC; //Set PA1 to Analog
-
-		GPIOA->PUPDR &= 0xFFFFFFF3;
-
-		RCC-> APB2ENR |= RCC_APB2ENR_ADCEN; //Clock for ADC
-
-		ADC1-> CFGR1 = 0x3000;
-
-		ADC1-> CR |= 0x1;
-
-		ADC1->SMPR |= 0x7;
-
-		ADC1-> CHSELR |= 0x2;
-
-		while(((ADC1->ISR) & 0x1) == 0);
-			ADC1 -> CR |= 0x4;
-}
-
-void myTim3Init_Config(){
-	RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
-	/* Configure TIM2: buffer auto-reload, count up, stop on overflow,
-		 * enable update events, interrupt on overflow only */
-		// Relevant register: TIM2->CR1
-	TIM3->CR1 = ((uint16_t)0x008C);
-	/* Set clock prescaler value */
-	TIM3->PSC = 0x0;
-	/* Set auto-reloaded delay */
-	TIM3->ARR = 0x23280;
-	//
-	TIM3->EGR = ((uint16_t)0x0001);
-}
-
-void myTim3Init_Refresh(){
-	RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
-		/* Configure TIM2: buffer auto-reload, count up, stop on overflow,
-			 * enable update events, interrupt on overflow only */
-			// Relevant register: TIM2->CR1
-	TIM3->CR1 = ((uint16_t)0x008C);
-		/* Set clock prescaler value */
-	TIM3->PSC = 0x0;
-		/* Set auto-reloaded delay */
-	TIM3->ARR = 0x493E00;
-		//
-	TIM3->EGR = ((uint16_t)0x0001);
-}
-
-
+void oled_Init( )
+{
+    SPI_Handle.Instance = SPI2;
+    SPI_Handle.Init.Direction = SPI_DIRECTION_1LINE;
+    SPI_Handle.Init.Mode = SPI_MODE_MASTER;
+    SPI_Handle.Init.DataSize = SPI_DATASIZE_8BIT;
+    SPI_Handle.Init.CLKPolarity = SPI_POLARITY_LOW;
+    SPI_Handle.Init.CLKPhase = SPI_PHASE_1EDGE;
+    SPI_Handle.Init.NSS = SPI_NSS_SOFT;
+    SPI_Handle.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+    SPI_Handle.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    SPI_Handle.Init.CRCPolynomial = 7;
 //
-// LED Display Functions
+// Initialize the SPI interface
 //
+    HAL_SPI_Init( &SPI_Handle );
+//
+// Enable the SPI
+//
+    __HAL_SPI_ENABLE( &SPI_Handle );
+/* Reset LED Display (RES# = PB11):
+- make pin PB11 = 0, wait for a few ms
+- make pin PB11 = 1, wait for a few ms */
+    GPIOB->BSRR = 0x08000000;
+    TIM3 -> CR1 |= TIM_CR1_CEN;
+    while((TIM3 -> SR & 0x1) == 0);
+    TIM3->SR &= ~TIM_SR_UIF;
+    GPIOB->BSRR = 0x00000800;
+    TIM3 -> CR1 |= TIM_CR1_CEN;
+    while((TIM3 -> SR & 0x1) == 0);
+    TIM3->SR &= ~TIM_SR_UIF;
+//
+// Send initialization commands to LED Display
+//
+    for ( unsigned int i = 0; i < sizeof( oled_init_cmds ); i++ )
+    {
+        oled_Write_Cmd( oled_init_cmds[i] );
+    }
 
+    /* Fill LED Display data memory (GDDRAM) with zeros:
+       - for each PAGE = 0, 1, ..., 7
+           set starting SEG = 0
+           call oled_Write_Data( 0x00 ) 128 times*/
 
-void refresh_OLED( void )
+    for(int i = 0; i < 8; i++)
+    {
+	  oled_Write_Cmd(0x00);  // SEG lower bits
+	  oled_Write_Cmd(0x10);  // SEG upper bits
+	  oled_Write_Cmd(0xB0 | i);
+	  	  for(int j = 0; j < 128; j++)
+	  	  {
+	  		  oled_Write_Data(0x00);
+	  	  }
+    }
+}
+
+void refresh_OLED(void)
 {
     // Buffer size = at most 16 characters per PAGE + terminating '\0'
     unsigned char Buffer[17];
@@ -400,10 +398,10 @@ void refresh_OLED( void )
 
     	oled_Write_Cmd(0xB0);  // PAGE 0
         oled_Write_Cmd(0x03);  // SEG lower bits
-        oled_Write_Cmd(0x10);  // SEG upper bits
+        oled_Write_Cmd(0x10);  // SEG upper bits (we start at segment 3)
 
 
-        for (i = 0; Buffer[i] != '\0'; i++)
+        for (i = 0; Buffer[i] != '\0'; i++) //write until the end of the buffer
         {
             for (j = 0; j < 8; j++)
             {
@@ -437,9 +435,9 @@ void refresh_OLED( void )
        - You should use TIM3 to implement this delay (e.g., via polling)
     */
 
-    TIM3 -> CR1 |= TIM_CR1_CEN;
-        while((TIM3 -> SR & 0x1) == 0);
-        TIM3->SR &= ~TIM_SR_UIF;
+    	TIM3 -> CR1 |= TIM_CR1_CEN; //start timer, it has been configured to overflow after 100ms
+        while((TIM3 -> SR & 0x1) == 0); //wait for overflow flag
+        TIM3->SR &= ~TIM_SR_UIF; //clear status register
 
 }
 
@@ -479,92 +477,123 @@ void oled_Write( unsigned char Value )
     /* Wait until transmission is complete (TXE = 1 in SPI2_SR) */
 
     while((SPI2->SR & SPI_SR_TXE) == 0);
-
 }
 
-void myGPIOB_Init()
+//---------------------Interrupts---------------------//
+
+  // This handler is declared in system/src/cmsis/vectors_stm32f051x8.c
+void TIM2_IRQHandler()
 {
-	/* Enable clock for GPIOB peripheral */
-	// Relevant register: RCC->AHBENR
-	RCC-> AHBENR |= RCC_AHBENR_GPIOBEN;
+  	/* Check if update interrupt flag is indeed set */
+  	if ((TIM2->SR & TIM_SR_UIF) != 0)
+  	{
+  		trace_printf("\n*** Overflow! ***\n");
 
-	/* Configure PB I/O */
-	GPIOB->MODER = 0x88450000;
-
-	/* Ensure no pull-up/pull-down for PB2 */
-	// Relevant register: GPIOB->PUPDR
-	GPIOB->PUPDR = 0x00450000;
+  		/* Clear update interrupt flag */
+  		// Relevant register: TIM2->SR
+  		TIM2->SR &= ~(TIM_SR_UIF);
+  		/* Restart stopped timer */
+  		// Relevant register: TIM2->CR1
+  		TIM2->CR1 |= TIM_CR1_CEN;
+   }
 }
 
-
-void oled_config( void )
+  /* This handler is declared in system/src/cmsis/vectors_stm32f051x8.c */
+void EXTI2_3_IRQHandler()
 {
+      uint32_t count;
+      uint32_t frequency;
 
-// Don't forget to enable GPIOB clock in RCC
-// Don't forget to configure PB13/PB15 as AF0
-// Don't forget to enable SPI2 clock in RCC
+      // Check PB2 or PB3 depending on selected mode
+      if (sw == 0 && (EXTI->PR & EXTI_PR_PR2)) //sw == 0 means we are using PB2, so we check line 2 for triggering edge
+      {
+          // First edge: start timer
+          if (timerTriggered == 0)
+          {
+              TIM2->CNT = 0;
+              TIM2->CR1 |= TIM_CR1_CEN; //start timer
+              timerTriggered = 1; //next time we know the timer was started
+          }
+          // Second edge: stop timer and calculate frequency
+          else //timertriggered was 1, so we are on the second edge
+          {
+              TIM2->CR1 &= ~TIM_CR1_CEN; //stop timer
 
-    SPI_Handle.Instance = SPI2;
+              count = TIM2->CNT; //read count value
 
-    SPI_Handle.Init.Direction = SPI_DIRECTION_1LINE;
-    SPI_Handle.Init.Mode = SPI_MODE_MASTER;
-    SPI_Handle.Init.DataSize = SPI_DATASIZE_8BIT;
-    SPI_Handle.Init.CLKPolarity = SPI_POLARITY_LOW;
-    SPI_Handle.Init.CLKPhase = SPI_PHASE_1EDGE;
-    SPI_Handle.Init.NSS = SPI_NSS_SOFT;
-    SPI_Handle.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
-    SPI_Handle.Init.FirstBit = SPI_FIRSTBIT_MSB;
-    SPI_Handle.Init.CRCPolynomial = 7;
+              if (count != 0) //prevent division by 0
+              {
+                  frequency = 48000000 / count;
+                  Freq = frequency;
+              }
 
-//
-// Initialize the SPI interface
-//
-    HAL_SPI_Init( &SPI_Handle );
+              timerTriggered = 0;
+          }
 
-//
-// Enable the SPI
-//
-    __HAL_SPI_ENABLE( &SPI_Handle );
+          EXTI->PR = EXTI_PR_PR2; //clear flag
+      }
 
+      else if (sw == 1 && (EXTI->PR & EXTI_PR_PR3)) //PB3
+      {
 
-    /* Reset LED Display (RES# = PB11):
-       - make pin PB11 = 0, wait for a few ms
-       - make pin PB11 = 1, wait for a few ms
-    */
-    GPIOB->BSRR = 0x08000000;
-    TIM3 -> CR1 |= TIM_CR1_CEN;
-    while((TIM3 -> SR & 0x1) == 0);
-    TIM3->SR &= ~TIM_SR_UIF;
-    GPIOB->BSRR = 0x00000800;
-    TIM3 -> CR1 |= TIM_CR1_CEN;
-    while((TIM3 -> SR & 0x1) == 0);
-    TIM3->SR &= ~TIM_SR_UIF;
+          if (timerTriggered == 0)
+          {
+              TIM2->CNT = 0;
+              TIM2->CR1 |= TIM_CR1_CEN;
+              timerTriggered = 1;
+          }
 
-//
-// Send initialization commands to LED Display
-//
-    for ( unsigned int i = 0; i < sizeof( oled_init_cmds ); i++ )
-    {
-        oled_Write_Cmd( oled_init_cmds[i] );
-    }
+          else
+          {
+              TIM2->CR1 &= ~TIM_CR1_CEN;
 
+              count = TIM2->CNT;
 
-    /* Fill LED Display data memory (GDDRAM) with zeros:
-       - for each PAGE = 0, 1, ..., 7
-           set starting SEG = 0
-           call oled_Write_Data( 0x00 ) 128 times
-    */
+              if (count != 0)
+              {
+                  frequency = 48000000 / count;
+                  Freq = frequency;
+              }
 
+              timerTriggered = 0;
+          }
 
-  for(int i = 0; i < 8; i++){
-	  oled_Write_Cmd(0x00);  // SEG lower bits
-	    oled_Write_Cmd(0x10);  // SEG upper bits
-	  oled_Write_Cmd(0xB0 | i);
-	  for(int j = 0; j < 128; j++){
-		  oled_Write_Data(0x00);
-	  }
+          EXTI->PR = EXTI_PR_PR3;
+     }
+ }
+
+  void EXTI0_1_IRQHandler()
+  {
+      if (EXTI->PR & EXTI_PR_PR0) //rising edge on line 0
+      {
+
+          sw ^= 1; //flip sw
+
+          TIM2->CR1 &= ~TIM_CR1_CEN; //disable timer
+
+          TIM2->CNT = 0; //set count to 0
+          timerTriggered = 0; //set timer triggered flag to 0
+
+          EXTI->PR = EXTI_PR_PR2 | EXTI_PR_PR3;
+
+          if (sw == 0)
+          {
+        	  GPIOC -> BSRR = 0x01000200; //flip leds
+              EXTI->IMR |= EXTI_IMR_MR2; //EXTI line 2 active
+              EXTI->IMR &= ~EXTI_IMR_MR3; //EXTI line 3 not active (masked)
+          }
+          else
+          {
+        	  GPIOC -> BSRR = 0x02000100; //flip leds
+              EXTI->IMR |= EXTI_IMR_MR3; //EXTI line 2 active
+              EXTI->IMR &= ~EXTI_IMR_MR2; //EXTI line 2 not active (masked)
+          }
+
+          // Clear button interrupt
+          EXTI->PR = EXTI_PR_PR0; //clear flag
+      }
   }
-}
+
 
 #pragma GCC diagnostic pop
 
